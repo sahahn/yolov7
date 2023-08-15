@@ -1202,6 +1202,7 @@ class ComputeLossAuxOTA:
     def __call__(self, p, targets, imgs):  # predictions, targets, model   
         device = targets.device
         lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+
         bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = self.build_targets2(p[:self.nl], targets, imgs)
         bs, as_, gjs, gis, targets, anchors = self.build_targets(p[:self.nl], targets, imgs)
         pre_gen_gains_aux = [torch.tensor(pp.shape, device=device)[[3, 2, 3, 2]] for pp in p[:self.nl]] 
@@ -1400,7 +1401,8 @@ class ComputeLossAuxOTA:
                 matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
             fg_mask_inboxes = matching_matrix.sum(0) > 0.0
             matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
-        
+
+            from_which_layer = from_which_layer.to(fg_mask_inboxes.device) 
             from_which_layer = from_which_layer[fg_mask_inboxes]
             all_b = all_b[fg_mask_inboxes]
             all_a = all_a[fg_mask_inboxes]
@@ -1553,7 +1555,8 @@ class ComputeLossAuxOTA:
                 matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
             fg_mask_inboxes = matching_matrix.sum(0) > 0.0
             matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
-        
+
+            from_which_layer = from_which_layer.to(fg_mask_inboxes.device) 
             from_which_layer = from_which_layer[fg_mask_inboxes]
             all_b = all_b[fg_mask_inboxes]
             all_a = all_a[fg_mask_inboxes]

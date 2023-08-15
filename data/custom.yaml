@@ -1,0 +1,5 @@
+train: ./cancer/train.txt
+val: ./cancer/val.txt
+
+nc: 1
+names: ['cancer_lesion']

@@ -18,8 +18,10 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
+from torch.utils.data.sampler import WeightedRandomSampler
 from tqdm import tqdm
-
+import deephealth_utils.data.utils as dh_utils
+import imageio
 import pickle
 from copy import deepcopy
 #from pycocotools import mask as maskUtils
@@ -42,6 +44,37 @@ for orientation in ExifTags.TAGS.keys():
         break
 
 
+def load_image_array(im_path: str) -> np.ndarray:
+    """Helper method to load a single image array from file path (no metadata)."""
+    if '.png' in im_path:
+        im_arr = imageio.imread(im_path)
+
+    else:
+        im_arr = dh_utils.dcm_to_preprocessed_array(
+            im_path,
+            slice_num=None,
+            return_metadata=False,
+            apply_windowing=True,
+            standardize_window_params=True,
+            allow_other_manufacturers=True
+        )
+
+    assert isinstance(im_arr, np.ndarray), "Loaded data should be a numpy array."
+    as_img = np.stack((im_arr, im_arr, im_arr), axis=-1)
+
+    # Normalize the values to the range [0, 255]
+    as_img_normalized = cv2.normalize(
+        as_img,
+        None,
+        alpha=0,
+        beta=255,
+        norm_type=cv2.NORM_MINMAX,
+        dtype=cv2.CV_8U
+    )
+
+    return as_img_normalized
+
+
 def get_hash(files):
     # Returns a single hash value of a list of files
     return sum(os.path.getsize(f) for f in files if os.path.isfile(f))
@@ -62,8 +95,46 @@ def exif_size(img):
     return s
 
 
+def create_weighted_sampler(dataset):
+    labels_per_class = [label[:, 0].tolist() for label in dataset.labels if label.shape[0] > 0]
+    labels_per_class = [j for sub in labels_per_class for j in sub]
+
+    labels_per_class = np.array(labels_per_class)
+
+    background_count = len([1 for label in dataset.labels if label.shape[0] == 0])
+
+    unique_classes, counts = np.unique(labels_per_class, return_counts=True)
+    weight_cls = 1 / counts
+
+    # create a dictionary for the weight of each class
+    weight_dict = {}
+    for _cls, weight in zip(unique_classes, weight_cls):
+        weight_dict[_cls] = weight
+
+    weight_background = 1 / background_count
+
+    final_weights = []
+    for label in dataset.labels:
+        if label.shape[0] == 0:
+            final_weights.append(weight_background)
+        else:
+            # use weighted sum of labels for weight in case there are multiple labels for the same image
+            label_classes = np.unique(label[:, 0]).tolist()
+            values = []
+            for cls_ in label_classes:
+                values.append(weight_dict[cls_])
+
+            final_weights.append(sum(values) / len(values))
+
+    final_weights = np.array(final_weights)
+
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(final_weights),
+        num_samples=len(final_weights) // 100
+    )
+
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', validation=False):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -79,9 +150,22 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    # sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+
+    if not validation:
+        assert rank == -1, 'Currently multi-GPU Support is not enabled when using weighted sampler'
+        sampler = create_weighted_sampler(dataset)
+    else:
+        sampler = None
+
+    # # Custom weighted sampling
+    # filtered = len(list(filter(lambda item: item.shape[0] > 0, dataset.labels)))
+    # percent = filtered / len(dataset.labels)
+    # weights = [percent if item.shape[0] == 0 else 1 - percent for item in dataset.labels]
+    # weights = np.array(weights)
+    # sampler = torch.utils.data.WeightedRandomSampler(torch.from_numpy(weights), len(weights))
+
     loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
-    # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
     dataloader = loader(dataset,
                         batch_size=batch_size,
                         num_workers=nw,
@@ -137,22 +221,13 @@ class LoadImages:  # for inference
         else:
             raise Exception(f'ERROR: {p} does not exist')
 
-        images = [x for x in files if x.split('.')[-1].lower() in img_formats]
-        videos = [x for x in files if x.split('.')[-1].lower() in vid_formats]
-        ni, nv = len(images), len(videos)
-
+        self.files = files
         self.img_size = img_size
         self.stride = stride
-        self.files = images + videos
-        self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
+
+        self.nf = len(files)
         self.mode = 'image'
-        if any(videos):
-            self.new_video(videos[0])  # new video
-        else:
-            self.cap = None
-        assert self.nf > 0, f'No images or videos found in {p}. ' \
-                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
+        self.cap = None
 
     def __iter__(self):
         self.count = 0
@@ -163,29 +238,9 @@ class LoadImages:  # for inference
             raise StopIteration
         path = self.files[self.count]
 
-        if self.video_flag[self.count]:
-            # Read video
-            self.mode = 'video'
-            ret_val, img0 = self.cap.read()
-            if not ret_val:
-                self.count += 1
-                self.cap.release()
-                if self.count == self.nf:  # last video
-                    raise StopIteration
-                else:
-                    path = self.files[self.count]
-                    self.new_video(path)
-                    ret_val, img0 = self.cap.read()
-
-            self.frame += 1
-            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.nframes}) {path}: ', end='')
-
-        else:
-            # Read image
-            self.count += 1
-            img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'Image Not Found ' + path
-            #print(f'image {self.count}/{self.nf} {path}: ', end='')
+        # Read image
+        self.count += 1
+        img0 = load_image_array(path)
 
         # Padded resize
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
@@ -196,156 +251,13 @@ class LoadImages:  # for inference
 
         return path, img, img0, self.cap
 
-    def new_video(self, path):
-        self.frame = 0
-        self.cap = cv2.VideoCapture(path)
-        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
     def __len__(self):
-        return self.nf  # number of files
-
-
-class LoadWebcam:  # for inference
-    def __init__(self, pipe='0', img_size=640, stride=32):
-        self.img_size = img_size
-        self.stride = stride
-
-        if pipe.isnumeric():
-            pipe = eval(pipe)  # local camera
-        # pipe = 'rtsp://192.168.1.64/1'  # IP camera
-        # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
-        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
-
-        self.pipe = pipe
-        self.cap = cv2.VideoCapture(pipe)  # video capture object
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # set buffer size
-
-    def __iter__(self):
-        self.count = -1
-        return self
-
-    def __next__(self):
-        self.count += 1
-        if cv2.waitKey(1) == ord('q'):  # q to quit
-            self.cap.release()
-            cv2.destroyAllWindows()
-            raise StopIteration
-
-        # Read frame
-        if self.pipe == 0:  # local camera
-            ret_val, img0 = self.cap.read()
-            img0 = cv2.flip(img0, 1)  # flip left-right
-        else:  # IP camera
-            n = 0
-            while True:
-                n += 1
-                self.cap.grab()
-                if n % 30 == 0:  # skip frames
-                    ret_val, img0 = self.cap.retrieve()
-                    if ret_val:
-                        break
-
-        # Print
-        assert ret_val, f'Camera Error {self.pipe}'
-        img_path = 'webcam.jpg'
-        print(f'webcam {self.count}: ', end='')
-
-        # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
-
-        # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
-        img = np.ascontiguousarray(img)
-
-        return img_path, img, img0, None
-
-    def __len__(self):
-        return 0
-
-
-class LoadStreams:  # multiple IP or RTSP cameras
-    def __init__(self, sources='streams.txt', img_size=640, stride=32):
-        self.mode = 'stream'
-        self.img_size = img_size
-        self.stride = stride
-
-        if os.path.isfile(sources):
-            with open(sources, 'r') as f:
-                sources = [x.strip() for x in f.read().strip().splitlines() if len(x.strip())]
-        else:
-            sources = [sources]
-
-        n = len(sources)
-        self.imgs = [None] * n
-        self.sources = [clean_str(x) for x in sources]  # clean source names for later
-        for i, s in enumerate(sources):
-            # Start the thread to read frames from the video stream
-            print(f'{i + 1}/{n}: {s}... ', end='')
-            url = eval(s) if s.isnumeric() else s
-            if 'youtube.com/' in str(url) or 'youtu.be/' in str(url):  # if source is YouTube video
-                check_requirements(('pafy', 'youtube_dl'))
-                import pafy
-                url = pafy.new(url).getbest(preftype="mp4").url
-            cap = cv2.VideoCapture(url)
-            assert cap.isOpened(), f'Failed to open {s}'
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = cap.get(cv2.CAP_PROP_FPS) % 100
-
-            _, self.imgs[i] = cap.read()  # guarantee first frame
-            thread = Thread(target=self.update, args=([i, cap]), daemon=True)
-            print(f' success ({w}x{h} at {self.fps:.2f} FPS).')
-            thread.start()
-        print('')  # newline
-
-        # check for common shapes
-        s = np.stack([letterbox(x, self.img_size, stride=self.stride)[0].shape for x in self.imgs], 0)  # shapes
-        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
-        if not self.rect:
-            print('WARNING: Different stream shapes detected. For optimal performance supply similarly-shaped streams.')
-
-    def update(self, index, cap):
-        # Read next stream frame in a daemon thread
-        n = 0
-        while cap.isOpened():
-            n += 1
-            # _, self.imgs[index] = cap.read()
-            cap.grab()
-            if n == 4:  # read every 4th frame
-                success, im = cap.retrieve()
-                self.imgs[index] = im if success else self.imgs[index] * 0
-                n = 0
-            time.sleep(1 / self.fps)  # wait time
-
-    def __iter__(self):
-        self.count = -1
-        return self
-
-    def __next__(self):
-        self.count += 1
-        img0 = self.imgs.copy()
-        if cv2.waitKey(1) == ord('q'):  # q to quit
-            cv2.destroyAllWindows()
-            raise StopIteration
-
-        # Letterbox
-        img = [letterbox(x, self.img_size, auto=self.rect, stride=self.stride)[0] for x in img0]
-
-        # Stack
-        img = np.stack(img, 0)
-
-        # Convert
-        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB, to bsx3x416x416
-        img = np.ascontiguousarray(img)
-
-        return self.sources, img, img0, None
-
-    def __len__(self):
-        return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
+        return self.nf
 
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
+    img_paths = [img.split(' ')[0] for img in img_paths]
     sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
     return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
 
@@ -361,39 +273,21 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
-        self.path = path        
-        #self.albumentations = Albumentations() if augment else None
+        self.path = path
 
-        try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('**/*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p, 'r') as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
-            assert self.img_files, f'{prefix}No images found'
-        except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
+        with open(path, 'r') as file:
+            raw_files = file.read().strip().splitlines()
 
-        # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
+        self.img_files = [file.split(' ')[1] for file in raw_files]
+        label_locs = [file.split(' ')[0] for file in raw_files]
+
+        self.label_files = img2label_paths(label_locs)
+
+        cache_path = Path(self.label_files[0]).parent.with_suffix('.cache')
         if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
-            #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-            #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
+            cache, exists = torch.load(cache_path), True
         else:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
+            cache, exists = self.cache_labels(cache_path, prefix), False
 
         # Display cache
         nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
@@ -474,13 +368,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
         for i, (im_file, lb_file) in enumerate(pbar):
             try:
-                # verify images
-                im = Image.open(im_file)
-                im.verify()  # PIL verify
-                shape = exif_size(im)  # image size
+
+                image = load_image_array(im_file)
+                shape = image.shape[:2]
+
                 segments = []  # instance segments
                 assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
-                assert im.format.lower() in img_formats, f'invalid image format {im.format}'
 
                 # verify labels
                 if os.path.isfile(lb_file):
@@ -524,12 +417,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
     def __len__(self):
         return len(self.img_files)
-
-    # def __iter__(self):
-    #     self.count = -1
-    #     print('ran dataset iter')
-    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
-    #     return self
 
     def __getitem__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
@@ -668,7 +555,8 @@ def load_image(self, index):
     img = self.imgs[index]
     if img is None:  # not cached
         path = self.img_files[index]
-        img = cv2.imread(path)  # BGR
+
+        img = load_image_array(path)
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
@@ -1156,7 +1044,7 @@ def cutout(image, labels):
             labels = labels[ioa < 0.60]  # remove >60% obscured labels
 
     return labels
-    
+
 
 def pastein(image, labels, sample_labels, sample_images, sample_masks):
     # Applies image cutout augmentation https://arxiv.org/abs/1708.04552
@@ -1265,7 +1153,7 @@ def extract_boxes(path='../coco/'):  # from utils.datasets import *; extract_box
     for im_file in tqdm(files, total=n):
         if im_file.suffix[1:] in img_formats:
             # image
-            im = cv2.imread(str(im_file))[..., ::-1]  # BGR to RGB
+            im = load_image_array(str(im_file))[..., ::-1] # BGR to RGB
             h, w = im.shape[:2]
 
             # labels
